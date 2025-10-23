@@ -1,0 +1,260 @@
+"""
+Focus & Scroll Tracker v10
+--------------------------
+Features:
+ - Face, iris, and head tracking for focus
+ - Smoothed focus value with yaw/pitch filtering
+ - Gesture scroll using index finger
+ - Anti-jitter scroll smoothing
+ - Two-hand heart "Like" gesture (requires prior scroll)
+ - Cooldowns for like/scroll
+ - NEW: Per-hand stabilization (each hand must be visible long enough before scroll is active)
+"""
+
+import cv2
+import mediapipe as mp
+import numpy as np
+import pyautogui
+import time
+
+mp_face_mesh = mp.solutions.face_mesh
+mp_hands = mp.solutions.hands
+mp_drawing = mp.solutions.drawing_utils
+
+cap = cv2.VideoCapture(0)
+
+face_mesh = mp_face_mesh.FaceMesh(
+    max_num_faces=1,
+    refine_landmarks=True,
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5
+)
+hands = mp_hands.Hands(
+    max_num_hands=2,
+    min_detection_confidence=0.7,
+    min_tracking_confidence=0.7
+)
+
+FOCUS_THRESHOLD = 0.6
+SCROLL_AMOUNT = 120
+SCROLL_COOLDOWN = 1.0
+SMOOTHING_ALPHA = 0.3
+LIKE_COOLDOWN = 2.0
+HAND_STABLE_FRAMES = 10  # each hand must be seen this many frames before scrolling allowed
+
+last_scroll_time = 0
+scroll_state = "neutral"
+prev_index_y = {}
+last_like_time = 0
+show_heart_until = 0
+can_like = True
+hand_seen_frames = {}
+hand_last_seen = {}
+
+# ---------- Utility ----------
+def euclidean_distance(a, b):
+    return np.linalg.norm(np.array([a.x, a.y]) - np.array([b.x, b.y]))
+
+
+def get_eye_aspect_ratio(landmarks, idx):
+    p1, p2, p3, p4, p5, p6 = [landmarks[i] for i in idx]
+    ear = (euclidean_distance(p2, p6) + euclidean_distance(p3, p5)) / (2.0 * euclidean_distance(p1, p4))
+    return ear
+
+
+def get_head_pose_angles(landmarks, img_shape):
+    image_points = np.array([
+        (landmarks[1].x, landmarks[1].y),
+        (landmarks[152].x, landmarks[152].y),
+        (landmarks[33].x, landmarks[33].y),
+        (landmarks[263].x, landmarks[263].y),
+        (landmarks[61].x, landmarks[61].y),
+        (landmarks[291].x, landmarks[291].y)
+    ], dtype="double")
+
+    img_h, img_w = img_shape[:2]
+    image_points[:, 0] *= img_w
+    image_points[:, 1] *= img_h
+
+    model_points = np.array([
+        (0.0, 0.0, 0.0),
+        (0.0, -63.6, -12.5),
+        (-43.3, 32.7, -26.0),
+        (43.3, 32.7, -26.0),
+        (-28.9, -28.9, -24.1),
+        (28.9, -28.9, -24.1)
+    ])
+
+    focal_length = img_w
+    center = (img_w / 2, img_h / 2)
+    cam_matrix = np.array([[focal_length, 0, center[0]],
+                           [0, focal_length, center[1]],
+                           [0, 0, 1]], dtype="double")
+    dist_coeffs = np.zeros((4, 1))
+
+    success, rotation_vec, _ = cv2.solvePnP(model_points, image_points, cam_matrix, dist_coeffs)
+    if not success:
+        return 0, 0, 0
+
+    rot_matrix, _ = cv2.Rodrigues(rotation_vec)
+    proj_matrix = np.hstack((rot_matrix, np.zeros((3, 1))))
+    _, _, _, _, _, _, eulerAngles = cv2.decomposeProjectionMatrix(proj_matrix)
+    pitch, yaw, roll = [float(angle) for angle in eulerAngles]
+    return yaw, pitch, roll
+
+
+def get_iris_focus(landmarks):
+    left_eye = [33, 133]
+    right_eye = [362, 263]
+    left_iris = [468]
+    right_iris = [473]
+    left_ratio = (landmarks[left_iris[0]].x - landmarks[left_eye[0]].x) / \
+                 (landmarks[left_eye[1]].x - landmarks[left_eye[0]].x)
+    right_ratio = (landmarks[right_eye[1]].x - landmarks[right_iris[0]].x) / \
+                  (landmarks[right_eye[1]].x - landmarks[right_eye[0]].x)
+    avg_ratio = (left_ratio + right_ratio) / 2.0
+    focus_weight = max(0.0, 1.0 - abs(avg_ratio - 0.5) * 3.0)
+    return np.clip(focus_weight, 0.0, 1.0)
+
+
+# ---------- Scroll Detection ----------
+def detect_index_scroll(hand_id, hand_landmarks):
+    global last_scroll_time, scroll_state, can_like
+    INDEX_TIP = 8
+    current_y = hand_landmarks.landmark[INDEX_TIP].y
+
+    if hand_id not in prev_index_y:
+        prev_index_y[hand_id] = current_y
+        return
+
+    dy = prev_index_y[hand_id] - current_y
+    prev_index_y[hand_id] = current_y
+    now = time.time()
+    threshold = 0.03
+
+    if dy > threshold and scroll_state != "up" and now - last_scroll_time > SCROLL_COOLDOWN:
+        pyautogui.scroll(120)
+        scroll_state = "up"
+        last_scroll_time = now
+        can_like = True
+        print(f"☝️ Scroll Up (Hand {hand_id})")
+
+    elif dy < -threshold and scroll_state != "down" and now - last_scroll_time > SCROLL_COOLDOWN:
+        pyautogui.scroll(-120)
+        scroll_state = "down"
+        last_scroll_time = now
+        can_like = True
+        print(f"👇 Scroll Down (Hand {hand_id})")
+
+    elif abs(dy) < 0.01:
+        scroll_state = "neutral"
+
+
+# ---------- Like Gesture ----------
+def detect_full_heart(hand_landmarks_list):
+    global last_like_time, show_heart_until, can_like
+    if len(hand_landmarks_list) < 2 or not can_like:
+        return False
+
+    now = time.time()
+    if now - last_like_time < LIKE_COOLDOWN:
+        return False
+
+    left = hand_landmarks_list[0].landmark
+    right = hand_landmarks_list[1].landmark
+    left_index = left[8]
+    left_middle = left[12]
+    right_index = right[8]
+    right_middle = right[12]
+    index_dist = euclidean_distance(left_index, right_index)
+    middle_dist = euclidean_distance(left_middle, right_middle)
+    wrist_dist = euclidean_distance(left[0], right[0])
+
+    if index_dist < 0.08 and middle_dist < 0.08 and 0.15 < wrist_dist < 0.45:
+        last_like_time = now
+        show_heart_until = now + 1.2
+        can_like = False
+        pyautogui.press('l')
+        print("💞 Full Heart Detected → Like")
+        return True
+    return False
+
+
+# ---------- Main Loop ----------
+print("🔹 Starting Focus & Scroll Tracker v10 (Press ESC to exit)")
+smoothed_focus = 0.0
+
+while cap.isOpened():
+    success, frame = cap.read()
+    if not success:
+        break
+
+    frame = cv2.flip(frame, 1)
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    img_h, img_w, _ = frame.shape
+
+    face_result = face_mesh.process(rgb)
+    hand_result = hands.process(rgb)
+
+    # ----- Focus -----
+    if face_result.multi_face_landmarks:
+        face_landmarks = face_result.multi_face_landmarks[0]
+        left_eye_idx = [33, 160, 158, 133, 153, 144]
+        ear = get_eye_aspect_ratio(face_landmarks.landmark, left_eye_idx)
+        eye_focus = 1.0 if ear > 0.18 else 0.0
+        iris_focus = get_iris_focus(face_landmarks.landmark)
+        yaw, pitch, roll = get_head_pose_angles(face_landmarks.landmark, frame.shape)
+        head_focus = 1.0 if abs(yaw) < 30 and abs(pitch) < 25 else 0.0
+        raw_focus = 0.4 * eye_focus + 0.4 * head_focus + 0.2 * iris_focus
+        smoothed_focus = SMOOTHING_ALPHA * raw_focus + (1 - SMOOTHING_ALPHA) * smoothed_focus
+        color = (0, 255, 0) if smoothed_focus >= FOCUS_THRESHOLD else (0, 0, 255)
+        cv2.putText(frame, f"Focus: {smoothed_focus:.2f}", (30, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
+    else:
+        smoothed_focus *= 0.8
+        cv2.putText(frame, "No Face Detected", (30, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+
+    # ----- Hands -----
+    if hand_result.multi_hand_landmarks:
+        hand_landmarks_list = []
+        for i, hl in enumerate(hand_result.multi_hand_landmarks):
+            mp_drawing.draw_landmarks(frame, hl, mp_hands.HAND_CONNECTIONS)
+            hand_landmarks_list.append(hl)
+
+            # Update per-hand stabilization
+            hand_seen_frames[i] = hand_seen_frames.get(i, 0) + 1
+            hand_last_seen[i] = time.time()
+
+            if hand_seen_frames[i] > HAND_STABLE_FRAMES:
+                detect_index_scroll(i, hl)
+
+        detect_full_heart(hand_landmarks_list)
+
+    # Cleanup old hands (if disappeared)
+    to_remove = []
+    now = time.time()
+    for hand_id, last_time in hand_last_seen.items():
+        if now - last_time > 0.5:
+            to_remove.append(hand_id)
+    for hid in to_remove:
+        hand_seen_frames.pop(hid, None)
+        hand_last_seen.pop(hid, None)
+        prev_index_y.pop(hid, None)
+
+    # ----- Like Feedback -----
+    if time.time() < show_heart_until:
+        cv2.putText(frame, "💖 Liked!", (img_w//2 - 80, img_h//2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 0, 200), 4)
+
+    cv2.imshow("Focus & Scroll Tracker v10", frame)
+    if cv2.waitKey(1) & 0xFF == 27:
+        break
+
+cap.release()
+cv2.destroyAllWindows()
+
+
+
+
+
